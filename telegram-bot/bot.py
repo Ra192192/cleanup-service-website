@@ -30,7 +30,6 @@ logger = logging.getLogger(__name__)
 
 DATABASE_URL = os.environ["DATABASE_URL"]
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "5"))
 
 ADD_ADMIN_BUTTON = "Добавить админа"
 SHOW_PENDING_BUTTON = "Показать ожидающие заявки"
@@ -66,21 +65,27 @@ def init_db() -> None:
     )
     run_db(
         """
-        CREATE TABLE IF NOT EXISTS bot_state (
-            key VARCHAR(80) PRIMARY KEY,
-            value TEXT NOT NULL
-        )
+        CREATE OR REPLACE FUNCTION notify_new_lead()
+        RETURNS trigger AS $$
+        BEGIN
+            PERFORM pg_notify('new_lead', NEW.id::text);
+            RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql
         """
     )
-    row = run_db("SELECT MAX(id) AS max_id FROM leads", fetch="one")
-    max_id = row["max_id"] or 0
     run_db(
         """
-        INSERT INTO bot_state (key, value)
-        VALUES ('last_notified_lead_id', %s)
-        ON CONFLICT (key) DO NOTHING
-        """,
-        (str(max_id),),
+        DROP TRIGGER IF EXISTS leads_notify_new_lead ON leads
+        """
+    )
+    run_db(
+        """
+        CREATE TRIGGER leads_notify_new_lead
+        AFTER INSERT ON leads
+        FOR EACH ROW
+        EXECUTE FUNCTION notify_new_lead()
+        """
     )
 
 
@@ -116,35 +121,15 @@ def add_admin(telegram_id: int, name: str) -> None:
     )
 
 
-def get_last_notified_id() -> int:
-    row = run_db(
-        "SELECT value FROM bot_state WHERE key = 'last_notified_lead_id'",
-        fetch="one",
-    )
-    return int(row["value"]) if row else 0
-
-
-def set_last_notified_id(lead_id: int) -> None:
-    run_db(
-        """
-        INSERT INTO bot_state (key, value)
-        VALUES ('last_notified_lead_id', %s)
-        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
-        """,
-        (str(lead_id),),
-    )
-
-
-def get_new_leads(after_id: int) -> list[dict]:
+def get_lead_by_id(lead_id: int) -> dict | None:
     return run_db(
         """
         SELECT id, name, phone, what_to_remove, status
         FROM leads
-        WHERE id > %s
-        ORDER BY id
+        WHERE id = %s
         """,
-        (after_id,),
-        fetch="all",
+        (lead_id,),
+        fetch="one",
     )
 
 
@@ -390,25 +375,33 @@ async def notify_admins(application: Application, admins: Iterable[dict], lead: 
             logger.exception("Failed to notify admin %s", admin["telegram_id"])
 
 
-async def poll_new_leads(application: Application) -> None:
+async def listen_new_leads(application: Application) -> None:
     while True:
         try:
-            admins = get_admins()
-            if admins:
-                last_id = get_last_notified_id()
-                leads = get_new_leads(last_id)
-                for lead in leads:
-                    await notify_admins(application, admins, lead)
-                    set_last_notified_id(lead["id"])
-        except Exception:
-            logger.exception("Lead polling failed")
+            async with await psycopg.AsyncConnection.connect(DATABASE_URL, autocommit=True) as conn:
+                await conn.execute("LISTEN new_lead")
+                logger.info("Listening for PostgreSQL notifications on channel new_lead")
 
-        await asyncio.sleep(POLL_INTERVAL_SECONDS)
+                async for notify in conn.notifies():
+                    try:
+                        lead_id = int(notify.payload)
+                    except ValueError:
+                        logger.warning("Received invalid new_lead payload: %s", notify.payload)
+                        continue
+
+                    lead = get_lead_by_id(lead_id)
+                    admins = get_admins()
+                    if lead and admins:
+                        await notify_admins(application, admins, lead)
+        except Exception:
+            logger.exception("Lead notification listener failed")
+
+        await asyncio.sleep(5)
 
 
 async def post_init(application: Application) -> None:
     init_db()
-    asyncio.create_task(poll_new_leads(application))
+    asyncio.create_task(listen_new_leads(application))
 
 
 def main() -> None:

@@ -68,7 +68,6 @@ services:
     environment:
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?Set TELEGRAM_BOT_TOKEN in .env}
       DATABASE_URL: postgresql://cleanup_user:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/cleanup_site
-      POLL_INTERVAL_SECONDS: 5
     restart: unless-stopped
 
 volumes:
